@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://json.schemastore.org/github-action.json
+# yaml-language-server: $schema=https://www.schemastore.org/github-action.json
 # https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions
 ---
 name: actionlint
@@ -62,6 +62,10 @@ inputs:
     description: GitHub Token
     required: false
     default: ${{ github.token }}
+  github-server-url:
+    description: GitHub server to download the actionlint tool from. Defaults to public github.com so the external rhysd/actionlint tool is always found; override only if you mirror rhysd/actionlint on your GHES, e.g. https://ghes.example.com
+    required: false
+    default: https://github.com
 outputs:
   version-semver:
     description: SemVer version
@@ -89,13 +93,13 @@ runs:
   using: composite
   steps:
     - name: Set tool environment
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       id: environment
       with:
         github-token: ${{ inputs.github-token || inputs.token || env.GITHUB_TOKEN }}
         script: |
           // input envs
-          const { INPUT_TOOL_NAME, INPUT_TOOL_SEMVER, INPUT_REPO_OWNER, INPUT_REPO_NAME, RUNNER_TEMP } = process.env
+          const { INPUT_TOOL_NAME, INPUT_TOOL_SEMVER, INPUT_REPO_OWNER, INPUT_REPO_NAME, INPUT_GITHUB_SERVER_URL, RUNNER_TEMP } = process.env
 
           // define tool platform and arch
           const processPlatform = process.platform // https://nodejs.org/api/process.html#processplatform
@@ -147,35 +151,65 @@ runs:
               process.exit(core.ExitCode.Failure)
           }
 
-          // helpers
-          async function getToolReleaseLatest() {
-            const response = await github.rest.repos.getLatestRelease({
-              owner: INPUT_REPO_OWNER,
-              repo: INPUT_REPO_NAME
+          // GitHub server to fetch the tool from (defaults to public github.com so the external
+          // rhysd/actionlint tool is always found; override via github-server-url for a GHES mirror)
+          const serverUrl = (INPUT_GITHUB_SERVER_URL || 'https://github.com').replace(/\/+$/, '')
+          const apiBaseUrl = serverUrl === 'https://github.com' ? 'https://api.github.com' : `${serverUrl}/api/v3`
+          const rawBaseUrl = serverUrl === 'https://github.com' ? 'https://raw.githubusercontent.com' : `${serverUrl}/raw`
+
+          // resolve the release tag while avoiding GitHub API calls where possible
+          // (REST calls count against the GITHUB_TOKEN rate limit, which busy CI can exhaust)
+          const isLatest = !INPUT_TOOL_SEMVER || INPUT_TOOL_SEMVER === 'latest'
+
+          // discover the latest tag by following the redirect on the releases/latest page (no API call)
+          async function getLatestTagFromRedirect() {
+            const https = await import('node:https')
+            return await new Promise((resolve, reject) => {
+              const request = https.get(
+                `${serverUrl}/${INPUT_REPO_OWNER}/${INPUT_REPO_NAME}/releases/latest`,
+                { headers: { 'user-agent': INPUT_TOOL_NAME } },
+                (res) => {
+                  res.resume() // drain the response so the socket can close
+                  const location = res.headers['location']
+                  if (res.statusCode >= 300 && res.statusCode < 400 && location) {
+                    resolve(location.split('/').pop().trim())
+                  } else {
+                    reject(new Error(`unexpected response (status: ${res.statusCode})`))
+                  }
+                }
+              )
+              request.setTimeout(10000, () => request.destroy(new Error('request timed out')))
+              request.on('error', reject)
             })
-            return response.data
           }
 
-          async function getToolReleaseByTag(versionTag) {
-            const response = await github.rest.repos.getReleaseByTag({
+          // proxy-aware fallback via the authenticated client; only used if the redirect approach fails
+          async function getLatestTagFromApi() {
+            const response = await github.request('GET /repos/{owner}/{repo}/releases/latest', {
               owner: INPUT_REPO_OWNER,
               repo: INPUT_REPO_NAME,
-              tag: versionTag
+              baseUrl: apiBaseUrl
             })
-            return response.data
+            return response.data.tag_name
           }
 
-          // get tool release data
-          const release =
-            INPUT_TOOL_SEMVER === 'latest' || INPUT_TOOL_SEMVER === '' || INPUT_TOOL_SEMVER === undefined || INPUT_TOOL_SEMVER === null
-              ? await getToolReleaseLatest()
-              : await getToolReleaseByTag(`v${INPUT_TOOL_SEMVER}`)
+          let versionTag
+          if (isLatest) {
+            try {
+              versionTag = await getLatestTagFromRedirect()
+            } catch (err) {
+              core.debug(`[${INPUT_TOOL_NAME}] latest-release redirect failed (${err.message}); falling back to GitHub API`)
+              versionTag = await getLatestTagFromApi()
+            }
+          } else {
+            // pinned version: build the tag directly, no network call needed
+            versionTag = `v${INPUT_TOOL_SEMVER.replace(/^v/, '')}`
+          }
 
-          const versionTag = release.tag_name
           const versionSemVer = versionTag.replace(/^v/, '')
           const toolDirPath = core.toPlatformPath(`${RUNNER_TEMP}/${INPUT_TOOL_NAME}-${versionSemVer}`)
-          const toolDownloadUrl = release.assets.find(asset => asset.name === `${INPUT_TOOL_NAME}_${versionSemVer}_${toolOs}_${toolArch}.${toolExt}`).browser_download_url.trim()
-          const matcherDownloadUrl = `https://raw.githubusercontent.com/${INPUT_REPO_OWNER}/${INPUT_REPO_NAME}/${versionTag}/.github/actionlint-matcher.json`
+          const toolDownloadUrl = `${serverUrl}/${INPUT_REPO_OWNER}/${INPUT_REPO_NAME}/releases/download/${versionTag}/${INPUT_TOOL_NAME}_${versionSemVer}_${toolOs}_${toolArch}.${toolExt}`
+          const matcherDownloadUrl = `${rawBaseUrl}/${INPUT_REPO_OWNER}/${INPUT_REPO_NAME}/${versionTag}/.github/actionlint-matcher.json`
           const matcherPath = core.toPlatformPath(`${toolDirPath}/actionlint-matcher.json`)
 
           // set outputs
@@ -193,36 +227,53 @@ runs:
         INPUT_REPO_OWNER: "rhysd"
         INPUT_REPO_NAME: "actionlint"
         INPUT_TOOL_SEMVER: ${{ inputs.version }}
+        INPUT_GITHUB_SERVER_URL: ${{ inputs.github-server-url }}
 
     - name: Set cache
       if: ${{ inputs.cache == 'true' }}
       id: tool-cache
-      uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.environment.outputs.tool-dir-path }}
         key: ${{ format('{0}-{1}-{2}-{3}', steps.environment.outputs.tool-name, steps.environment.outputs.tool-version-semver, runner.os, runner.arch) }}
 
     - name: Install dependencies
       if: ${{ steps.tool-cache.outputs.cache-hit != 'true' }}
-      run: npm install --no-save --ignore-scripts --legacy-peer-deps @actions/tool-cache@3.0.1
+      run: npm install --prefix "${{ runner.temp }}/actionlint-action" --no-save --no-package-lock --no-audit --no-fund --ignore-scripts --legacy-peer-deps @actions/tool-cache@4.0.0
       shell: ${{ (runner.os == 'Windows' && 'pwsh') || 'bash' }}
       working-directory: ${{ inputs.working-directory }}
 
     - name: Download tool
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       if: ${{ steps.tool-cache.outputs.cache-hit != 'true' }}
       with:
         github-token: ${{ inputs.github-token || inputs.token || env.GITHUB_TOKEN }}
         script: |
           // dependencies
-          const tc = require('@actions/tool-cache')
+          // @actions/tool-cache v4 is a pure-ESM package installed into an isolated RUNNER_TEMP dir, so it
+          // neither pollutes nor is affected by the user's workspace node_modules; github-script evaluates
+          // this inline script in a non-module context where bare specifiers can't be resolved, so import
+          // it directly via its file URL
+          const { pathToFileURL } = await import('node:url')
+          const { join } = await import('node:path')
+          const toolCacheEntry = join(process.env.RUNNER_TEMP, 'actionlint-action', 'node_modules', '@actions', 'tool-cache', 'lib', 'tool-cache.js')
+          const tc = await import(pathToFileURL(toolCacheEntry).href)
 
           // input envs
           const { INPUT_TOOL_NAME, INPUT_TOOL_DIR_PATH, INPUT_TOOL_DOWNLOAD_URL, INPUT_MATCHER_DOWNLOAD_URL, INPUT_MATCHER_PATH } = process.env
 
           // download tool
           await io.mkdirP(INPUT_TOOL_DIR_PATH)
-          const toolTempPath = await tc.downloadTool(INPUT_TOOL_DOWNLOAD_URL)
+          let toolTempPath
+          try {
+            toolTempPath = await tc.downloadTool(INPUT_TOOL_DOWNLOAD_URL)
+          } catch (err) {
+            if (err && err.httpStatusCode === 404) {
+              core.setFailed(`[${INPUT_TOOL_NAME}] Release asset not found (HTTP 404) - check the 'version' input points to a published release: ${INPUT_TOOL_DOWNLOAD_URL}`)
+              process.exit(core.ExitCode.Failure)
+            }
+            throw err
+          }
 
           // extract tool
           if (INPUT_TOOL_DOWNLOAD_URL.endsWith('.zip')) {
@@ -245,7 +296,7 @@ runs:
         INPUT_MATCHER_PATH: ${{ steps.environment.outputs.matcher-path }}
 
     - name: Install tool dependencies
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       if: ${{ inputs.pyflakes == 'true' || inputs.shellcheck == 'true' }}
       id: tool-dependencies
       with:
@@ -311,7 +362,7 @@ runs:
         INPUT_SHELLCHECK: ${{ inputs.shellcheck }}
 
     - name: Run tool
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       id: tool-runner
       with:
         github-token: ${{ inputs.github-token || inputs.token || env.GITHUB_TOKEN }}
@@ -384,8 +435,8 @@ runs:
           const { exitCode, stdout, stderr } = await exec.getExecOutput(INPUT_TOOL_EXECUTABLE, toolFlags, { silent: true, ignoreReturnCode: true })
 
           //if (INPUT_JSON === 'true') {
-          //  const fs = require('fs')
-          //   const path = require('path')
+          //  const fs = await import('node:fs')
+          //   const path = await import('node:path')
           //   const jsonPath = path.join(process.env.GITHUB_WORKSPACE, 'actionlint.json')
           //   fs.writeFileSync(jsonPath, stdout)
           //   core.info(`##[add-annotation]file=${jsonPath},title=actionlint.json`)
